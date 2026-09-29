@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Runtime data (raw downloads + local SQLite corpus)
+data/raw/
+data/*.sqlite
+data/*.sqlite-journal
+data/*.sqlite-wal
+data/*.sqlite-shm
+
+# Keep seed and manifests tracked (do NOT ignore):
+#   seed_targets.json, corpus_manifest.json, CORPUS.md
+
+# OS / editor
+.DS_Store
+*.swp
