@@ -65,6 +65,41 @@ def _target_from_meta(meta: dict[str, object]) -> SeedTarget:
     )
 
 
+def sniff_filetype(raw_bytes: bytes, raw_path: Path) -> str:
+    """Return ``'docx'``/``'pdf'``/``'html'`` from magic bytes then extension.
+
+    Deterministic file-type detection so Phase C routes each RAW to the right
+    extractor (Word -> python-docx, PDF -> pdfminer, HTML -> BeautifulSoup):
+
+    * ``PK\\x03\\x04`` + a ``word/`` marker -> ``docx`` (OOXML ZIP container);
+    * ``%PDF-`` -> ``pdf``;
+    * otherwise the file extension, defaulting to ``html``.
+    """
+    if raw_bytes[:4] == b"PK\x03\x04" and b"word/" in raw_bytes[:200000]:
+        return "docx"
+    if raw_bytes[:5] == b"%PDF-":
+        return "pdf"
+    suffix = raw_path.suffix.lower().lstrip(".")
+    if suffix in {"docx", "pdf", "html", "htm"}:
+        return "htm" if suffix == "html" else suffix
+    return "html"
+
+
+def _pdf_has_text_layer(raw_bytes: bytes) -> bool:
+    """True when a PDF exposes an extractable text layer (deterministic).
+
+    Used only to distinguish a born-digital PDF (pdfminer reads it directly)
+    from a SCANNED PDF (image-only) that would need OCR. OCR is a documented,
+    NON-BLOCKING fallback: we never invoke it in this deterministic phase.
+    """
+    try:
+        from .adapters.base import extract_pdf_text
+
+        return bool(extract_pdf_text(raw_bytes).strip())
+    except Exception:  # noqa: BLE001 - a malformed PDF is treated as no text
+        return False
+
+
 def _iter_raw_dirs(raw_root: Path) -> list[Path]:
     """Return the per-doc raw directories (those carrying a meta.json), sorted."""
     if not raw_root.exists():
@@ -166,12 +201,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             if doc.status == IngestStatus.NO_ENCONTRADO.value:
                 # Record the outcome but do NOT fabricate document/article rows.
+                motivo = doc.error_detail or "norm not found in source"
+                # Documented, NON-BLOCKING OCR fallback: a scanned PDF (image
+                # only, no text layer) cannot be segmented deterministically.
+                # We flag it so a later OCR pass can pick it up; we never OCR
+                # here (this phase stays LLM-free and deterministic).
+                if sniff_filetype(raw_bytes, raw_path) == "pdf" and not _pdf_has_text_layer(
+                    raw_bytes
+                ):
+                    motivo = (
+                        "PDF escaneado sin capa de texto: OCR pendiente como "
+                        "respaldo (no bloqueante, fuera de esta fase determinista)."
+                    )
                 log_event(
                     conn,
                     IngestStatus.NO_ENCONTRADO.value,
                     doc_id=doc.doc_id,
                     url=target.donde_buscar,
-                    message=doc.error_detail or "norm not found in source",
+                    message=motivo,
                 )
                 per_status[IngestStatus.NO_ENCONTRADO.value] += 1
                 continue

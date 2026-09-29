@@ -141,7 +141,10 @@ def test_phase_b_continues_past_fetch_error(tmp_path, monkeypatch) -> None:
     _write_seed(
         clean,
         [
-            _entry("Ley timeout", bad, canonico=["ley", "1", "2020"]),
+            # A jurisprudencia entry stays on the HTTP path (LEXIS handles only
+            # leyes/decretos/codigos/estatutos), so this exercises FetchError
+            # resilience of the polite-client download flow.
+            _entry("Sentencia timeout", bad, canonico=["jurisprudencia", "C-1", "2020"]),
             _entry("Codigo de prueba", good),
         ],
     )
