@@ -29,6 +29,15 @@ intervencion humana ni de un modelo.
   `python3` del sistema (p. ej. 3.9) **no** debe usarse.
 - [`uv`](https://docs.astral.sh/uv/) para gestionar el entorno y las
   dependencias.
+- **Navegador Chromium para Playwright** (solo para la recoleccion en vivo de
+  LEXIS en la Fase B). Se instala una vez con:
+
+  ```bash
+  uv run playwright install chromium
+  ```
+
+  Descarga el binario de Chromium (no se ejecuta en las pruebas, que son
+  offline). El navegador corre **headless** con `--no-sandbox`.
 
 ## Instalacion (un solo comando)
 
@@ -36,14 +45,15 @@ No hay que instalar nada a mano: un unico comando de arranque prepara el
 entorno con el proyecto (editable) y las herramientas de desarrollo/test.
 
 ```bash
-cd /root/kiro/hackeaton
 uv sync --extra dev
 ```
 
-> `uv sync` a secas instala solo las dependencias de ejecucion. Para poder
-> correr las pruebas y el linter usa `uv sync --extra dev` (trae `pytest`,
-> `ruff`, `black` y `mypy` dentro del entorno del proyecto). Si hace falta,
-> fija la version con `uv python pin 3.12`.
+> `uv sync` a secas instala solo las dependencias de ejecucion (incluye
+> `playwright` y `python-docx`, que usa el recolector de LEXIS). Para correr las
+> pruebas y el linter usa `uv sync --extra dev` (trae `pytest`, `ruff`, `black`
+> y `mypy`). Si hace falta, fija la version con `uv python pin 3.12`. Para la
+> recoleccion en vivo de LEXIS instala tambien el navegador con
+> `uv run playwright install chromium`.
 
 ## Las tres fases (un comando por fase)
 
@@ -89,14 +99,52 @@ uv run corpus-fase-b
 uv run python -m corpus_ingesta.phase_b
 ```
 
-Lee `seed_targets_clean.json` y descarga el payload crudo (HTML/PDF) de cada
-entrada a `data/raw/<doc_id>/` (`raw.html`|`raw.pdf` + `meta.json`).
+Lee `seed_targets_clean.json` y descarga el payload crudo de cada entrada a
+`data/raw/<doc_id>/` (`raw.html`|`raw.pdf`|`raw.docx` + `meta.json`).
 **Raw-first**: primero se guardan los bytes originales, no se parsea nada aqui.
 El cliente educado respeta >= 1s entre solicitudes, backoff progresivo y un
 cache en disco por hash de URL, de modo que **una segunda corrida no vuelve a
 descargar** lo ya bajado. Un `FetchError` en una entrada se registra y la
 corrida **continua** con la siguiente (un host inalcanzable nunca aborta el
 lote).
+
+**Recoleccion de LEXIS con navegador headless (Playwright).** Las normas
+cubiertas por LEXIS (leyes, decretos, codigos, estatutos, constitucion, acto
+legislativo, acuerdo) se recolectan de otra forma: el buscador y el detalle de
+`lexis.minjusticia.gov.co` son una SPA (JavaScript), asi que el HTML crudo no
+sirve. La Fase B dirige un **Chromium headless** (`--no-sandbox`) que repite
+los mismos clics deterministas que un humano:
+
+1. abre el buscador Detallado (`.../buscador/Detallado/3`);
+2. aplica el **filtro de tipo** que corresponde al `canonico` de la norma
+   (`ley` -> `Ley`, `decreto` -> `Decreto`, los `codigo_*` -> `Codigo`, los
+   `estatuto_*` -> `Estatuto`, `constitucion` -> `Constitucion`, etc.);
+3. localiza en los resultados la fila que coincide por **numero + anio** (o por
+   tipo cuando la norma no tiene numero, como los codigos consolidados);
+4. abre su detalle `.../minjusticia/viewDocument/{id}`;
+5. hace clic en el control **descargar Word** y captura el `.docx`.
+
+La seleccion de la fila es **determinista** (coincidencia por numero/anio/tipo);
+si no hay coincidencia clara se registra `no_encontrado` con el motivo y **nunca
+se fabrica** una descarga. El `.docx` se guarda como `raw.docx` con un
+`meta.json` (`doc_id`, `norma`, `canonico`, `tipo`, `url_detalle`,
+`fecha_consulta`, `source=lexis_minjusticia`). Se aplica la misma cortesia (1s
+entre navegaciones, backoff progresivo) y un **cache raw-first**: si el `.docx`
+ya esta en disco no se vuelve a abrir el navegador. Las normas que **no** son de
+LEXIS (jurisprudencia -> Corte Constitucional, `decision_andina_486`, que puede
+no existir en LEXIS) no tocan el navegador.
+
+> El recolector de LEXIS ruteo por el `canonico [tipo, numero, anio]` de la
+> semilla, **no** por el `donde_buscar` heredado (que apuntaba a buscadores
+> rotos de suin/senado). Los tipos no cubiertos por LEXIS se registran como
+> `no_encontrado` sin inventar.
+
+> **Limitacion de validacion**: los portales `.gov.co` no son alcanzables desde
+> el entorno de construccion (timeouts / errores SSL), por lo que el flujo en
+> vivo Playwright<->LEXIS **solo se valido offline aqui** (con un navegador
+> simulado y fixtures `.docx` locales). El flujo real debe ejecutarse en la
+> maquina del usuario, que si alcanza el portal, con
+> `uv run playwright install chromium` seguido de `uv run corpus-fase-b`.
 
 ### Fase C — raw -> SQLite + manifiesto
 
@@ -106,8 +154,10 @@ uv run corpus-fase-c
 uv run python -m corpus_ingesta.phase_c
 ```
 
-Recorre `data/raw/<doc_id>/`, parsea cada documento a nivel de articulo y
-persiste:
+Recorre `data/raw/<doc_id>/`, **detecta el tipo de archivo** del RAW por magic
+bytes/extension y lo enruta al extractor correcto -- `.docx` -> `python-docx`
+(texto Word), HTML -> BeautifulSoup/lxml, PDF con capa de texto -> `pdfminer.six`
+--, lo segmenta a nivel de articulo (`ARTICULO N`) y persiste:
 
 - `data/corpus.sqlite` — metadatos + fragmentos con offsets (columnas
   `vector_id`/`embedding_ref` reservadas en NULL).
@@ -119,6 +169,13 @@ persiste:
 Una norma ausente de su fuente produce una fila `no_encontrado` en `ingest_log`
 y **cero** filas de documento/articulo (sin fabricacion).
 
+> **OCR como respaldo (no bloqueante)**: si un RAW es un **PDF escaneado** sin
+> capa de texto, la Fase C lo registra como `no_encontrado` con el motivo "PDF
+> escaneado ... OCR pendiente" y sigue con la siguiente norma. El OCR queda como
+> respaldo documentado **fuera** de esta fase determinista (jamas se invoca aqui
+> para mantenerla sin LLM). Como LEXIS entrega Word con capa de texto, la ruta
+> normal lee el `.docx` directamente sin necesidad de OCR.
+
 ## Arquitectura y mapa de directorios
 
 ```
@@ -127,6 +184,8 @@ src/corpus_ingesta/
   phase_b.py         # Fase B: descarga raw-first por doc_id
   phase_c.py         # Fase C: raw -> SQLite + manifiesto/CORPUS.md
   seed_io.py         # carga de semilla + ruteo compartido por las fases
+  lexis_client.py    # recolector LEXIS determinista (page-object mockeable, cortesia, match numero/anio)
+  lexis_playwright.py# implementacion Playwright del navegador headless (Chromium --no-sandbox)
   http_client.py     # PoliteClient (spacing, backoff, cache sha256, FetchError)
   db.py              # esquema SQLite + DAO (documents/articles/ingest_log)
   models.py          # SeedTarget / DocumentRecord / ArticleFragment / IngestStatus
@@ -197,8 +256,8 @@ vectorial.
 ## Restricciones del reglamento honradas
 
 - **Sin LLM en ejecucion**: los tres scripts son 100% deterministas
-  (BeautifulSoup/lxml/regex/reglas); ningun modelo abierto o cerrado participa
-  en la extraccion.
+  (Playwright con clics fijos + python-docx + BeautifulSoup/lxml/regex/reglas);
+  ningun modelo abierto o cerrado participa en la extraccion.
 - **Sin banco de preguntas**: el corpus no contiene ni indexa el banco de
   preguntas ni las respuestas esperadas de la competencia.
 - **Trazabilidad a nivel de articulo**: cada fragmento mapea a `norma` +
@@ -207,8 +266,9 @@ vectorial.
   `no_encontrado` (en `no_encontrados.json` y/o `ingest_log`), jamas se inventa.
 - **Manifiesto exacto**: cada objeto de `corpus_manifest.json` tiene
   EXACTAMENTE las seis claves mandatadas.
-- **Scraper educado**: >= 1s entre solicitudes, backoff progresivo y cache para
-  no re-descargar.
+- **Scraper educado**: >= 1s entre solicitudes/navegaciones, backoff progresivo
+  y cache para no re-descargar (tanto en el cliente HTTP como en el recolector
+  headless de LEXIS).
 
 ## Matriz de soporte por fuente
 
@@ -217,7 +277,7 @@ vectorial.
 | Secretaria del Senado | `secretariasenado.gov.co` | **Primario (HTML)** | Parser completo de `ARTICULO N`; la Fase A **resuelve las URLs de busqueda `?q=`** siguiendo el primer resultado que coincide con la norma hasta el `.html` consolidado. |
 | SUIN-Juriscol | `suin-juriscol.gov.co` | **Primario (HTML)** | Parser completo; **resolucion determinista del buscador `?q=`** por `[tipo, numero, anio]`; deteccion de "no resultados". |
 | Corte Constitucional | `corteconstitucional.gov.co` | Best-effort | Relatoria/jurisprudencia; resolucion del buscador `?q=` por identificador de sentencia. **Limitacion**: el buscador es una SPA Angular que carga resultados via JSON asincrono, por lo que la pagina de aterrizaje puede no exponer enlaces parseables; en ese caso la entrada se marca `no_encontrado` (nunca se fabrica). |
-| MinJusticia / Lexis | `lexis.minjusticia.gov.co` | Best-effort | Buscador; parseo aproximado. |
+| MinJusticia / LEXIS | `lexis.minjusticia.gov.co` | **Primario para NORMAS (navegador headless)** | Fuente principal de leyes, decretos, codigos, estatutos, constitucion, acto legislativo y acuerdo. SPA -> se recolecta con Playwright (Chromium headless): filtro de tipo -> fila por numero/anio -> `viewDocument/{id}` -> descarga `.docx`. Determinista; sin match -> `no_encontrado`. El flujo en vivo se valida en la maquina del usuario. |
 | Consejo de Estado / SAMAI | `samai.consejodeestado.gov.co` | **Opcional (no bloqueante)** | Portal `.aspx`; **limitacion documentada**: se omite sin abortar el resto. |
 
 > El Consejo de Estado (SAMAI, `.aspx`) es una **limitacion opcional y
@@ -238,6 +298,18 @@ Fase A las registra en `no_encontrados.json` y **nunca fabrica** una URL. El
 pipeline procesa **todas** las entradas presentes en `documentos`, sin importar
 cuantas sean; para ampliarlo, pega mas normas verbatim tal cual aparecen en la
 fuente oficial (no se inventan referencias legales).
+
+**Distribucion de la semilla por fuente de recoleccion (186 entradas):**
+
+- **111 jurisprudencia** -> **Corte Constitucional** (URL directa de relatoria;
+  NO pasan por LEXIS).
+- **74 normas** -> **LEXIS** (navegador headless): 49 leyes, 16 decretos,
+  1 acuerdo, la constitucion, y los codigos/estatutos consolidados
+  (`codigo_general_proceso`, `codigo_sustantivo_trabajo`, `codigo_infancia`,
+  `codigo_disciplinario`, `codigo_nacional_policia`, `estatuto_tributario`,
+  `estatuto_consumidor`).
+- **1 `decision_andina_486`** -> puede no existir en LEXIS; si el buscador no la
+  devuelve se registra `no_encontrado` sin inventar.
 
 > **Resolucion automatica del buscador (Fase A)**: casi todos los
 > `donde_buscar` de la semilla son paginas de busqueda `?q=`, p.ej.

@@ -117,12 +117,14 @@ def write_corpus_md(conn: sqlite3.Connection, path: str) -> None:
     lines.append("## Metodo")
     lines.append("")
     lines.append(
-        "- **Determinista, sin LLM**: la extraccion usa unicamente "
-        "BeautifulSoup/lxml, expresiones regulares y reglas."
+        "- **Determinista, sin LLM**: la extraccion usa unicamente un navegador "
+        "headless (Playwright, clics fijos) para LEXIS, python-docx para el "
+        "texto Word, y BeautifulSoup/lxml + expresiones regulares para HTML/PDF."
     )
     lines.append(
-        "- **Raw-first**: se guardan los bytes originales en `data/raw/<fuente>/` "
-        "antes de parsear; el cache en disco evita re-descargas."
+        "- **Raw-first**: se guardan los bytes originales (HTML/PDF/DOCX) en "
+        "`data/raw/<doc_id>/` antes de parsear; el cache en disco evita "
+        "re-descargas (incluido el `.docx` de LEXIS ya bajado)."
     )
     lines.append(
         "- **Scraper educado**: 1 segundo entre solicitudes y backoff progresivo "

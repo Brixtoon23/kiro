@@ -9,6 +9,8 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "lxml>=5.0",
     "pdfminer.six>=20231228",
+    "playwright>=1.63.0",
+    "python-docx>=1.2.0",
 ]
 
 [project.optional-dependencies]
